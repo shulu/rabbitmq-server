@@ -480,7 +480,8 @@ basic_get(Q, NoAck, CTag0, QState0) when ?amqqueue_is_quorum(Q) ->
                        _ -> 0
                     end,
             IsDelivered = Count > 0,
-            Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg0),
+            Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long,
+                                          Count, Msg0),
             {ok, MsgsReady, {QName, Id, MsgId, IsDelivered, Msg}, QState};
         {error, _} = Err ->
             Err;

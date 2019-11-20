@@ -831,7 +831,8 @@ declare_args() ->
      {<<"x-queue-type">>,              fun check_queue_type/2},
      {<<"x-quorum-initial-group-size">>,     fun check_default_quorum_initial_group_size_arg/2}].
 
-consume_args() -> [{<<"x-priority">>,              fun check_int_arg/2},
+consume_args() -> [{<<"x-stream-offset">>,         fun check_int_arg/2},
+                   {<<"x-priority">>,              fun check_int_arg/2},
                    {<<"x-cancel-on-ha-failover">>, fun check_bool_arg/2}].
 
 check_int_arg({Type, _}, _) ->
@@ -1595,12 +1596,21 @@ basic_consume(Q,
   when ?amqqueue_is_stream(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
+    rabbit_log:info("basic_consume stream args ~w", [Args]),
     ok = check_consume_arguments(QName, Args),
     QState0 = get_queue_client_state(Q, QName, QStates),
+    Offset = case rabbit_misc:table_lookup(Args, <<"x-stream-offset">>) of
+                 undefined -> undefined;
+                 {_, V} -> V
+             end,
+
     %% TODO: check consumer args from x-stream-offset
-    QState = rabbit_stream_queue:begin_stream(QState0, ConsumerTag, 0,
-                                              ConsumerPrefetchCount),
+    %% FIXME: reply needs to be sent before the stream begins sending
+    %% really it should be sent by the stream queue process like classic queues
+    %% do
     maybe_send_reply(ChPid, OkMsg),
+    QState = rabbit_stream_queue:begin_stream(QState0, ConsumerTag, Offset,
+                                              ConsumerPrefetchCount),
     {ok, maps:put(Name, QState, QStates)};
 basic_consume(Q,
               NoAck, ChPid, _LimiterPid, _LimiterActive, ConsumerPrefetchCount,

@@ -49,7 +49,8 @@ groups() ->
 
 all_tests() ->
     [
-     roundtrip
+     roundtrip,
+     time_travel
     ].
 
 %% -------------------------------------------------------------------
@@ -137,7 +138,6 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 
 roundtrip(Config) ->
-    % Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
     [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
 
     Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
@@ -200,6 +200,37 @@ roundtrip(Config) ->
     flush(100),
     ok.
 
+time_travel(Config) ->
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config, lists:last(Servers)),
+    QName = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', QName, 0, 0},
+                 declare(Ch, QName, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    CTag1 = <<"ctag1">>,
+    publish_many(Ch, QName, 100),
+    publish_confirm(Ch, QName, <<"msg1">>),
+    subscribe(Ch2, CTag1, QName, 1, [{<<"x-stream-offset">>, long, 50}]),
+    receive
+        {#'basic.deliver'{delivery_tag = DT1,
+                          consumer_tag = _CTag1,
+                          redelivered  = false},
+         #amqp_msg{props = #'P_basic'{headers = Headers}} = Msg} ->
+            {<<"x-stream-offset">>, long, Offs} =
+                rabbit_basic:header(<<"x-stream-offset">>, Headers),
+            %% assert offset is greater or equal to request
+            ct:pal("GOT ~w ~w", [Offs, Msg]),
+            ?assert(Offs >= 50),
+            amqp_channel:cast(Ch2, #'basic.ack'{delivery_tag = DT1,
+                                                multiple = false}),
+            flush(100),
+            ok
+    after 2000 ->
+              exit(basic_deliver_timeout_1)
+    end,
+    ok.
 
 %% HELPERS
 
