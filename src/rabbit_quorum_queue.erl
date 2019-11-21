@@ -41,7 +41,9 @@
          grow/4]).
 -export([transfer_leadership/2, get_replicas/1, queue_length/1]).
 -export([file_handle_leader_reservation/1, file_handle_other_reservation/0]).
--export([file_handle_release_reservation/0]).
+-export([file_handle_release_reservation/0,
+         make_ra_conf/4
+         ]).
 
 %%-include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit.hrl").
@@ -123,9 +125,10 @@ declare(Q) when ?amqqueue_is_quorum(Q) ->
     NewQ1 = amqqueue:set_type_state(NewQ0, #{nodes => Nodes}),
     case rabbit_amqqueue:internal_declare(NewQ1, false) of
         {created, NewQ} ->
+            ServerIds = members(NewQ),
             TickTimeout = application:get_env(rabbit, quorum_tick_interval, ?TICK_TIMEOUT),
-            RaConfs = [make_ra_conf(NewQ, ServerId, TickTimeout)
-                       || ServerId <- members(NewQ)],
+            RaConfs = [make_ra_conf(NewQ, ServerId, ServerIds, TickTimeout)
+                       || ServerId <- ServerIds],
             case ra:start_cluster(RaConfs) of
                 {ok, _, _} ->
                     rabbit_event:notify(queue_created,
@@ -245,44 +248,45 @@ handle_tick(QName,
     %% this makes calls to remote processes so cannot be run inside the
     %% ra server
     Self = self(),
-    _ = spawn(fun() ->
-                      R = reductions(Name),
-                      rabbit_core_metrics:queue_stats(QName, MR, MU, M, R),
-                      Util = case C of
-                                 0 -> 0;
-                                 _ -> rabbit_fifo:usage(Name)
-                             end,
-                      Infos = [{consumers, C}, {consumer_utilisation, Util},
-                               {message_bytes_ready, MsgBytesReady},
-                               {message_bytes_unacknowledged, MsgBytesUnack},
-                               {message_bytes, MsgBytesReady + MsgBytesUnack},
-                               {message_bytes_persistent, MsgBytesReady + MsgBytesUnack},
-                               {messages_persistent, M}
+    _ = spawn(
+          fun() ->
+                  R = reductions(Name),
+                  rabbit_core_metrics:queue_stats(QName, MR, MU, M, R),
+                  Util = case C of
+                             0 -> 0;
+                             _ -> rabbit_fifo:usage(Name)
+                         end,
+                  Infos = [{consumers, C}, {consumer_utilisation, Util},
+                           {message_bytes_ready, MsgBytesReady},
+                           {message_bytes_unacknowledged, MsgBytesUnack},
+                           {message_bytes, MsgBytesReady + MsgBytesUnack},
+                           {message_bytes_persistent,
+                            MsgBytesReady + MsgBytesUnack},
+                           {messages_persistent, M}
+                           | infos(QName)],
+                  rabbit_core_metrics:queue_stats(QName, Infos),
+                  rabbit_event:notify(queue_stats,
+                                      Infos ++ [{name, QName},
+                                                {messages, M},
+                                                {messages_ready, MR},
+                                                {messages_unacknowledged, MU},
+                                                {reductions, R}]),
+                  ok = repair_leader_record(QName, Self),
+                  ExpectedNodes = rabbit_mnesia:cluster_nodes(all),
+                  case Nodes -- ExpectedNodes of
+                      [] ->
+                          ok;
+                      Stale ->
+                          rabbit_log:info("~s: stale nodes detected. Purging ~w~n",
+                                          [rabbit_misc:rs(QName), Stale]),
+                          %% pipeline purge command
+                          {ok, Q} = rabbit_amqqueue:lookup(QName),
+                          ok = ra:pipeline_command(amqqueue:get_pid(Q),
+                                                   rabbit_fifo:make_purge_nodes(Stale)),
 
-                               | infos(QName)],
-                      rabbit_core_metrics:queue_stats(QName, Infos),
-                      rabbit_event:notify(queue_stats,
-                                          Infos ++ [{name, QName},
-                                                    {messages, M},
-                                                    {messages_ready, MR},
-                                                    {messages_unacknowledged, MU},
-                                                    {reductions, R}]),
-                      ok = repair_leader_record(QName, Self),
-                      ExpectedNodes = rabbit_mnesia:cluster_nodes(all),
-                      case Nodes -- ExpectedNodes of
-                          [] ->
-                              ok;
-                          Stale ->
-                              rabbit_log:info("~s: stale nodes detected. Purging ~w~n",
-                                              [rabbit_misc:rs(QName), Stale]),
-                              %% pipeline purge command
-                              {ok, Q} = rabbit_amqqueue:lookup(QName),
-                              ok = ra:pipeline_command(amqqueue:get_pid(Q),
-                                                       rabbit_fifo:make_purge_nodes(Stale)),
-
-                              ok
-                      end
-              end),
+                          ok
+                  end
+          end),
     ok.
 
 repair_leader_record(QName, Self) ->
@@ -327,7 +331,8 @@ recover(Queues) ->
                  % so needs to be started from scratch.
                  TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                                    ?TICK_TIMEOUT),
-                 Conf = make_ra_conf(Q0, {Name, node()}, TickTimeout),
+                 ServerIds = members(Q0),
+                 Conf = make_ra_conf(Q0, {Name, node()}, ServerIds, TickTimeout),
                  case ra:start_server(Conf) of
                      ok ->
                          ok;
@@ -738,7 +743,7 @@ add_member(Q, Node, Timeout) when ?amqqueue_is_quorum(Q) ->
     Members = members(Q),
     TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                       ?TICK_TIMEOUT),
-    Conf = make_ra_conf(Q, ServerId, TickTimeout),
+    Conf = make_ra_conf(Q, ServerId, Members, TickTimeout),
     case ra:start_server(Conf) of
         ok ->
             case ra:add_member(Members, ServerId, Timeout) of
@@ -1201,10 +1206,10 @@ members(Q) when ?amqqueue_is_quorum(Q) ->
     Nodes = lists:delete(LeaderNode, get_nodes(Q)),
     [{RaName, N} || N <- [LeaderNode | Nodes]].
 
-make_ra_conf(Q, ServerId, TickTimeout) ->
+make_ra_conf(Q, ServerId, ServerIds, TickTimeout) ->
     QName = amqqueue:get_name(Q),
     RaMachine = ra_machine(Q),
-    [{ClusterName, _} | _] = Members = members(Q),
+    [{ClusterName, _} | _] = Members = ServerIds,
     UId = ra:new_uid(ra_lib:to_binary(ClusterName)),
     FName = rabbit_misc:rs(QName),
     #{cluster_name => ClusterName,

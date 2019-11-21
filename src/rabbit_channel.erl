@@ -754,11 +754,11 @@ handle_info({ra_event, {Name, _} = From, EvtBody} = Evt,
                 consumer_mapping = ConsumerMapping} = State0) ->
     case QueueStates of
         #{Name := QState0} when ?IS_STREAM(QState0) ->
-            rabbit_log:info("ra event ~w", [Evt]),
+            % rabbit_log:info("ra event ~w", [Evt]),
             {internal, MsgSeqNos, _Actions, QState1} =
                 rabbit_stream_queue:handle_event(From, EvtBody, QState0),
             State = State0#ch{queue_states = maps:put(Name, QState1, QueueStates)},
-            rabbit_log:info("ra event msgsenos ~w", [MsgSeqNos]),
+            % rabbit_log:info("ra event msgsenos ~w", [MsgSeqNos]),
             %% TODO: execute actions
             noreply_coalesce(confirm(MsgSeqNos, Name, State));
         #{Name := QState0} ->
@@ -2442,7 +2442,9 @@ i(Item, _) ->
     throw({bad_argument, Item}).
 
 pending_raft_commands(QStates) ->
-    maps:fold(fun (_, V, Acc) ->
+    maps:fold(fun (_, V, Acc) when ?IS_STREAM(V) ->
+                      Acc + rabbit_stream_queue:pending_size(V);
+                  (_, V, Acc) ->
                       Acc + rabbit_fifo_client:pending_size(V)
               end, 0, QStates).
 

@@ -147,7 +147,7 @@ roundtrip(Config) ->
                  declare(Ch, QName, [{<<"x-queue-type">>, longstr, <<"stream">>}])),
     #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
     CTag1 = <<"ctag1">>,
-    subscribe(Ch2, CTag1, QName, 100, []),
+    subscribe(Ch2, CTag1, QName, 100, [{<<"x-stream-offset">>, long, 0}]),
     publish_confirm(Ch, QName, <<"msg1">>),
     receive
         {#'basic.deliver'{delivery_tag = DT1,
@@ -157,6 +157,7 @@ roundtrip(Config) ->
             flush(100),
             ok
     after 2000 ->
+              flush(100),
               exit(basic_deliver_timeout_1)
     end,
     publish_confirm(Ch, QName, <<"msg2">>),
@@ -173,7 +174,7 @@ roundtrip(Config) ->
     %% another consumer can read
     Ch3 = rabbit_ct_client_helpers:open_channel(Config, Server),
     CTag2 = <<"ctag2">>,
-    subscribe(Ch3, CTag2, QName, 1, []),
+    subscribe(Ch3, CTag2, QName, 1, [{<<"x-stream-offset">>, long, 0}]),
     receive
         {#'basic.deliver'{delivery_tag = DTag3,
                           consumer_tag = CTag2,

@@ -82,6 +82,7 @@
          is_durable/1,
          is_classic/1,
          is_quorum/1,
+         is_stream/1,
          pattern_match_all/0,
          pattern_match_on_name/1,
          pattern_match_on_type/1,
@@ -662,6 +663,9 @@ is_classic(Queue) ->
 
 is_quorum(Queue) ->
     get_type(Queue) =:= rabbit_quorum_queue.
+
+is_stream(Queue) ->
+    get_type(Queue) =:= rabbit_stream_queue.
 
 fields() ->
     case record_version_to_use() of

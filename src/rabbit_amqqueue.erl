@@ -120,7 +120,7 @@ recover(VHost) ->
     AllClassic = find_local_durable_classic_queues(VHost),
     Quorum = find_local_quorum_queues(VHost),
     {RecoveredClassic, FailedClassic} = recover_classic_queues(VHost, AllClassic),
-    {RecoveredClassic, FailedClassic, rabbit_quorum_queue:recover(Quorum)}.
+    {RecoveredClassic, FailedClassic, rabbit_ra_queue:recover(Quorum)}.
 
 recover_classic_queues(VHost, Queues) ->
     {ok, BQ} = application:get_env(rabbit, backing_queue_module),
@@ -194,7 +194,7 @@ find_local_quorum_queues(VHost) ->
       fun () ->
               qlc:e(qlc:q([Q || Q <- mnesia:table(rabbit_durable_queue),
                                 amqqueue:get_vhost(Q) =:= VHost,
-                                amqqueue:is_quorum(Q) andalso
+                                (amqqueue:is_quorum(Q) orelse amqqueue:is_stream(Q)) andalso
                                 (lists:member(Node, get_quorum_nodes(Q)))]))
       end).
 
@@ -1272,6 +1272,7 @@ get_queue_consumer_info(Q, ConsumerInfoKeys) ->
           {'ok', non_neg_integer(), non_neg_integer()}.
 
 stat(Q) when ?amqqueue_is_quorum(Q) -> rabbit_quorum_queue:stat(Q);
+stat(Q) when ?amqqueue_is_stream(Q) -> {ok, 0, 0};
 stat(Q) -> delegate:invoke(amqqueue:get_pid(Q), {gen_server2, call, [stat, infinity]}).
 
 -spec pid_of(amqqueue:amqqueue()) ->
@@ -1596,7 +1597,7 @@ basic_consume(Q,
   when ?amqqueue_is_stream(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
-    rabbit_log:info("basic_consume stream args ~w", [Args]),
+    rabbit_log:info("basic_consume stream args ~w ~w", [Args, ConsumerPrefetchCount]),
     ok = check_consume_arguments(QName, Args),
     QState0 = get_queue_client_state(Q, QName, QStates),
     Offset = case rabbit_misc:table_lookup(Args, <<"x-stream-offset">>) of

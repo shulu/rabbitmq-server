@@ -6,6 +6,7 @@
 -export([
          init/1,
          apply/3,
+         tick/2,
          init_aux/1,
          handle_aux/6,
 
@@ -17,19 +18,63 @@
 
          init_client/2,
          queue_name/1,
+         pending_size/1,
          handle_event/3,
 
          %% mgmt
-         declare/1
+         declare/1,
+
+         %% other
+         open_files/1,
+         make_ra_conf/4
 
 
          ]).
 
+-define(STATISTICS_KEYS,
+        [
+         policy,
+         % operator_policy,
+         % effective_policy_definition,
+         consumers,
+         memory,
+         state,
+         garbage_collection,
+         leader,
+         online,
+         members,
+         open_files
+         % single_active_consumer_pid,
+         % single_active_consumer_ctag,
+         % messages_ram,
+         % message_bytes_ram
+        ]).
+%% segment sizing is hard
+-define(SEG_MAX_MSGS, 100000).
+%% avoid creating ridiculously small segments
+-define(SEG_MIN_MSGS, 4096).
+-define(SEG_MAX_BYTES, 1000 * 1000 * 500). %% 500Mb
+-define(SEG_MAX_MS, 1000 * 60 * 60). %% 1hr
+
+-record(retention_spec,
+        {max_bytes = ?SEG_MAX_BYTES * 4 :: non_neg_integer(),
+         max_ms :: undefined | non_neg_integer()}).
+
 %% holds static or rarely changing fields
 -record(cfg, {id :: ra:server_id(),
-              name :: rabbit_types:r('queue')}).
+              name :: rabbit_types:r('queue'),
+              retention :: #retention_spec{}}).
+
+%% a log segment
+-record(seg, {from_system_time_ms :: non_neg_integer(),
+              to_system_time_ms :: non_neg_integer(),
+              from_idx :: ra:index(),
+              to_idx :: ra:index(),
+              num_msgs = 0 :: non_neg_integer(),
+              num_bytes = 0 :: non_neg_integer()}).
 
 -record(?MODULE, {cfg :: #cfg{},
+                  log_segments = [] :: [#seg{}],
                   last_index = 0 :: ra:index()}).
 
 -opaque state() :: #?MODULE{}.
@@ -43,22 +88,55 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+% calculate_log_stats(Segs) ->
+%     ok.
+
 
 %% MACHINE
 
 init(#{queue_name := QueueName,
        name := Name}) ->
     Cfg = #cfg{id = {Name, self()},
+               retention = #retention_spec{},
                name = QueueName},
     #?MODULE{cfg = Cfg}.
 
 -spec apply(map(), cmd(), state()) ->
     {state(), stream_index(), list()}.
-apply(#{index := RaftIndex}, {append, _Evt},
-      #?MODULE{} = State) ->
+apply(#{index := RaftIndex} = Meta, {append, Msg},
+      #?MODULE{log_segments = Segs0} = State) ->
     % rabbit_log:info("append ~b", [RaftIndex]),
-    % Index = rabbit_stream_index:incr(RaftIndex, Index0),
-    {State#?MODULE{last_index = RaftIndex}, RaftIndex, {aux, eval}}.
+    Segs = incr_log_segment(Meta, Segs0, Msg),
+    {State#?MODULE{last_index = RaftIndex,
+                   log_segments = Segs}, RaftIndex, {aux, eval}}.
+
+-spec tick(non_neg_integer(), state()) -> ra_machine:effects().
+tick(_Ts, #?MODULE{cfg = #cfg{id = {Name, _},
+                              name = QName},
+                   log_segments = Segs} = _State) ->
+    % CheckoutBytes = 0,
+    {NumMsgs, NumBytes}  = lists:foldl(fun(#seg{num_msgs = N, num_bytes = B},
+                                           {N0, B0}) ->
+                                               {N0 + N, B0 +B}
+                                       end, {0, 0}, Segs),
+    % Metrics = {Name,
+    %            messages_ready(State),
+    %            num_checked_out(State), % checked out
+    %            messages_total(State),
+    %            query_consumer_count(State), % Consumers
+    %            EnqueueBytes,
+    %            CheckoutBytes},
+    Infos = [
+             {message_bytes_ready, NumBytes},
+             {message_bytes_unacknowledged, 0},
+             {message_bytes, NumBytes},
+             {message_bytes_persistent, NumBytes},
+             {messages_persistent, NumMsgs}
+             | infos(QName)],
+    rabbit_core_metrics:queue_stats(QName, Infos),
+    R = reductions(Name),
+    rabbit_core_metrics:queue_stats(QName, NumMsgs, 0, NumMsgs, R),
+    [].
 
 %% AUX
 
@@ -152,7 +230,7 @@ stream_entries({Tag, Pid} = StreamId,
                        next_index = NextIdx} = Str0,
                Log0) when NextIdx =< MaxIndex ->
     %% e.g. min(101 + 50, 120) - 101
-    MaxCredit = min(NextIdx + Credit, MaxIndex) - NextIdx,
+    MaxCredit = 1 + min(NextIdx + Credit, MaxIndex) - NextIdx,
 
     % rabbit_log:info("stream entries from ~b ~b ~b",
     %                 [NextIdx, MaxCredit, MaxIndex]),
@@ -214,6 +292,9 @@ init_client(QueueName, ServerIds) when is_list(ServerIds) ->
 queue_name(#stream_client{name = Name}) ->
     Name.
 
+pending_size(#stream_client{correlation = Correlation}) ->
+    maps:size(Correlation).
+
 handle_event(_From, {applied, SeqsReplies},
                       #stream_client{correlation = Correlation0} = State) ->
     {Seqs, _} = lists:unzip(SeqsReplies),
@@ -236,7 +317,7 @@ append(#stream_client{leader = ServerId,
                         correlation = Correlation}.
 
 begin_stream(#stream_client{local = ServerId} = State, Tag, Offset, MaxInFlight)
-  when is_number(Offset) andalso is_number(MaxInFlight) ->
+  when is_number(MaxInFlight) ->
     Pid = self(),
     ok = ra:cast_aux_command(ServerId, {stream, Offset, MaxInFlight, Tag, Pid}),
     State.
@@ -317,3 +398,213 @@ make_ra_conf(Q, ServerId, ServerIds, TickTimeout) ->
 ra_machine(Q) ->
     QName = amqqueue:get_name(Q),
     {module, ?MODULE, #{queue_name => QName}}.
+
+
+message_size(#basic_message{content = Content}) ->
+    #content{payload_fragments_rev = PFR} = Content,
+    iolist_size(PFR);
+message_size(B) when is_binary(B) ->
+    byte_size(B);
+message_size(Msg) ->
+    %% probably only hit this for testing so ok to use erts_debug
+    erts_debug:size(Msg).
+
+incr_log_segment(#{index := Idx,
+                   system_time := Time}, [], Msg) ->
+    Bytes = message_size(Msg),
+    [#seg{from_system_time_ms = Time,
+          to_system_time_ms = Time,
+          from_idx = Idx,
+          to_idx = Idx,
+          num_msgs = 1,
+          num_bytes = Bytes}];
+incr_log_segment(#{index := Idx,
+                   system_time := Time},
+                 [#seg{from_system_time_ms = SegTime,
+                       num_msgs = NumMsgs0,
+                       num_bytes = NumBytes0} = Seg | Segs] = AllSegs, Msg) ->
+    Bytes = message_size(Msg),
+    NumBytes = NumBytes0 + Bytes,
+    NumMsgs = NumMsgs0 + 1,
+    %% check if a new segment should be created
+    case NumMsgs > ?SEG_MIN_MSGS andalso
+         (NumMsgs > ?SEG_MAX_MSGS orelse
+          NumBytes > ?SEG_MAX_BYTES orelse
+          Time - SegTime > ?SEG_MAX_MS) of
+        true ->
+            %% time for a new segment
+            [#seg{from_system_time_ms = Time,
+                  to_system_time_ms = Time,
+                  from_idx = Idx,
+                  to_idx = Idx,
+                  num_msgs = 1,
+                  num_bytes = Bytes} | AllSegs];
+        false ->
+            [Seg#seg{to_idx = Idx,
+                     to_system_time_ms = Time,
+                     num_msgs = NumMsgs,
+                     num_bytes = NumBytes} | Segs]
+    end.
+
+reductions(Name) ->
+    try
+        {reductions, R} = process_info(whereis(Name), reductions),
+        R
+    catch
+        error:badarg ->
+            0
+    end.
+
+infos(QName) ->
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} ->
+            info(Q, ?STATISTICS_KEYS);
+        {error, not_found} ->
+            []
+    end.
+
+-spec info(amqqueue:amqqueue(), rabbit_types:info_keys()) -> rabbit_types:infos().
+
+info(Q, Items) ->
+    [{Item, i(Item, Q)} || Item <- Items].
+
+i(name,        Q) when ?is_amqqueue(Q) -> amqqueue:get_name(Q);
+i(durable,     Q) when ?is_amqqueue(Q) -> amqqueue:is_durable(Q);
+i(auto_delete, Q) when ?is_amqqueue(Q) -> amqqueue:is_auto_delete(Q);
+i(arguments,   Q) when ?is_amqqueue(Q) -> amqqueue:get_arguments(Q);
+i(pid, Q) when ?is_amqqueue(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    whereis(Name);
+i(messages, Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    case ets:lookup(queue_coarse_metrics, QName) of
+        [{_, _, _, M, _}] ->
+            M;
+        [] ->
+            0
+    end;
+i(messages_ready, Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    case ets:lookup(queue_coarse_metrics, QName) of
+        [{_, MR, _, _, _}] ->
+            MR;
+        [] ->
+            0
+    end;
+i(messages_unacknowledged, Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    case ets:lookup(queue_coarse_metrics, QName) of
+        [{_, _, MU, _, _}] ->
+            MU;
+        [] ->
+            0
+    end;
+i(policy, Q) ->
+    case rabbit_policy:name(Q) of
+        none   -> '';
+        Policy -> Policy
+    end;
+i(operator_policy, Q) ->
+    case rabbit_policy:name_op(Q) of
+        none   -> '';
+        Policy -> Policy
+    end;
+i(effective_policy_definition, Q) ->
+    case rabbit_policy:effective_definition(Q) of
+        undefined -> [];
+        Def       -> Def
+    end;
+i(consumers, Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    case ets:lookup(queue_metrics, QName) of
+        [{_, M, _}] ->
+            proplists:get_value(consumers, M, 0);
+        [] ->
+            0
+    end;
+i(memory, Q) when ?is_amqqueue(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    try
+        {memory, M} = process_info(whereis(Name), memory),
+        M
+    catch
+        error:badarg ->
+            0
+    end;
+% i(state, Q) when ?is_amqqueue(Q) ->
+%     {Name, Node} = amqqueue:get_pid(Q),
+%     %% Check against the leader or last known leader
+%     case rpc:call(Node, ?MODULE, cluster_state, [Name], ?RPC_TIMEOUT) of
+%         {badrpc, _} -> down;
+%         State -> State
+%     end;
+i(local_state, Q) when ?is_amqqueue(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    case ets:lookup(ra_state, Name) of
+        [{_, State}] -> State;
+        _ -> not_member
+    end;
+i(garbage_collection, Q) when ?is_amqqueue(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    try
+        rabbit_misc:get_gc_info(whereis(Name))
+    catch
+        error:badarg ->
+            []
+    end;
+i(members, Q) when ?is_amqqueue(Q) ->
+    get_nodes(Q);
+% i(online, Q) ->
+i(leader, Q) ->
+    {_Name, Leader} = amqqueue:get_pid(Q),
+    Leader;
+i(open_files, Q) when ?is_amqqueue(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    Nodes = get_nodes(Q),
+    {Data, _} = rpc:multicall(Nodes, ?MODULE, open_files, [Name]),
+    lists:flatten(Data);
+i(single_active_consumer_pid, Q) when ?is_amqqueue(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    {ok, {_, SacResult}, _} = ra:local_query(QPid,
+                                             fun rabbit_fifo:query_single_active_consumer/1),
+    case SacResult of
+        {value, {_ConsumerTag, ChPid}} ->
+            ChPid;
+        _ ->
+            ''
+    end;
+i(single_active_consumer_ctag, Q) when ?is_amqqueue(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    {ok, {_, SacResult}, _} = ra:local_query(QPid,
+                                             fun rabbit_fifo:query_single_active_consumer/1),
+    case SacResult of
+        {value, {ConsumerTag, _ChPid}} ->
+            ConsumerTag;
+        _ ->
+            ''
+    end;
+i(type, _) -> quorum;
+i(messages_ram, Q) when ?is_amqqueue(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    {ok, {_, {Length, _}}, _} = ra:local_query(QPid,
+                                          fun rabbit_fifo:query_in_memory_usage/1),
+    Length;
+i(message_bytes_ram, Q) when ?is_amqqueue(Q) ->
+    QPid = amqqueue:get_pid(Q),
+    {ok, {_, {_, Bytes}}, _} = ra:local_query(QPid,
+                                         fun rabbit_fifo:query_in_memory_usage/1),
+    Bytes;
+i(_K, _Q) -> ''.
+
+get_nodes(Q) when ?is_amqqueue(Q) ->
+    #{nodes := Nodes} = amqqueue:get_type_state(Q),
+    Nodes.
+
+open_files(Name) ->
+    case whereis(Name) of
+        undefined -> {node(), 0};
+        Pid -> case ets:lookup(ra_open_file_metrics, Pid) of
+                   [] -> {node(), 0};
+                   [{_, Count}] -> {node(), Count}
+               end
+    end.
