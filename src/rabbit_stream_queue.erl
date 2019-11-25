@@ -26,7 +26,8 @@
 
          %% other
          open_files/1,
-         make_ra_conf/4
+         make_ra_conf/4,
+         cluster_state/1
 
 
          ]).
@@ -108,7 +109,7 @@ apply(#{index := RaftIndex} = Meta, {append, Msg},
     % rabbit_log:info("append ~b", [RaftIndex]),
     Segs = incr_log_segment(Meta, Segs0, Msg),
     {State#?MODULE{last_index = RaftIndex,
-                   log_segments = Segs}, RaftIndex, {aux, eval}}.
+                   log_segments = Segs}, RaftIndex}.
 
 -spec tick(non_neg_integer(), state()) -> ra_machine:effects().
 tick(_Ts, #?MODULE{cfg = #cfg{id = {Name, _},
@@ -148,7 +149,9 @@ tick(_Ts, #?MODULE{cfg = #cfg{id = {Name, _},
                     ctag(), pid()} |
                    {ack, {ctag(), pid()}, Index :: stream_index()} |
                    {stop_stream, pid()} |
-                   eval.
+                   %% built in
+                   eval |
+                   tick.
 
 -record(stream, {next_index :: ra:index(),
                  credit :: 0 | stream_index(),
@@ -221,7 +224,10 @@ handle_aux(_RaMachine, _Type, eval,
                                                            Cfg, S0, L0),
                                    {maps:put(StreamId, S, A0), L}
                            end, {#{}, Log0}, Aux0),
-    {no_reply, Aux, Log}.
+    {no_reply, Aux, Log};
+handle_aux(_RaMachine, _Type, tick,
+           Aux0, Log0, _MacState) ->
+    {no_reply, Aux0, Log0}.
 
 stream_entries({Tag, Pid} = StreamId,
                MaxIndex,
@@ -531,13 +537,13 @@ i(memory, Q) when ?is_amqqueue(Q) ->
         error:badarg ->
             0
     end;
-% i(state, Q) when ?is_amqqueue(Q) ->
-%     {Name, Node} = amqqueue:get_pid(Q),
-%     %% Check against the leader or last known leader
-%     case rpc:call(Node, ?MODULE, cluster_state, [Name], ?RPC_TIMEOUT) of
-%         {badrpc, _} -> down;
-%         State -> State
-%     end;
+i(state, Q) when ?is_amqqueue(Q) ->
+    {Name, Node} = amqqueue:get_pid(Q),
+    %% Check against the leader or last known leader
+    case rpc:call(Node, ?MODULE, cluster_state, [Name], 1000) of
+        {badrpc, _} -> down;
+        State -> State
+    end;
 i(local_state, Q) when ?is_amqqueue(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     case ets:lookup(ra_state, Name) of
@@ -554,7 +560,8 @@ i(garbage_collection, Q) when ?is_amqqueue(Q) ->
     end;
 i(members, Q) when ?is_amqqueue(Q) ->
     get_nodes(Q);
-% i(online, Q) ->
+i(online, Q) ->
+    get_nodes(Q);
 i(leader, Q) ->
     {_Name, Leader} = amqqueue:get_pid(Q),
     Leader;
@@ -607,4 +614,14 @@ open_files(Name) ->
                    [] -> {node(), 0};
                    [{_, Count}] -> {node(), Count}
                end
+    end.
+
+cluster_state(Name) ->
+    case whereis(Name) of
+        undefined -> down;
+        _ ->
+            case ets:lookup(ra_state, Name) of
+                [{_, recover}] -> recovering;
+                _ -> running
+            end
     end.
