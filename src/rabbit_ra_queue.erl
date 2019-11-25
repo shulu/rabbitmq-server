@@ -1,7 +1,8 @@
 -module(rabbit_ra_queue).
 
 -export([
-         recover/1
+         recover/1,
+         force_delete/1
          ]).
 
 %% holds static or rarely changing fields
@@ -51,6 +52,20 @@ recover(Queues) ->
          Q
      end || Q0 <- Queues].
 
+
+force_delete(Servers) ->
+    [begin
+         case catch(ra:force_delete_server(S)) of
+             ok -> ok;
+             Err ->
+                 rabbit_log:warning(
+                   "Force delete of ~w failed with: ~w"
+                   "This may require manual data clean up~n",
+                   [S, Err]),
+                 ok
+         end
+     end || S <- Servers],
+    ok.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

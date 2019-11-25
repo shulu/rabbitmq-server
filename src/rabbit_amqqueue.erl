@@ -1323,9 +1323,10 @@ delete_immediately_by_resource(Resources) ->
             rabbit_types:error('in_use') |
             rabbit_types:error('not_empty').
 
-delete(Q,
-       IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
+delete(Q, IfUnused, IfEmpty, ActingUser) when ?amqqueue_is_quorum(Q) ->
     rabbit_quorum_queue:delete(Q, IfUnused, IfEmpty, ActingUser);
+delete(Q, _IfUnused, _IfEmpty, ActingUser) when ?amqqueue_is_stream(Q) ->
+    rabbit_stream_queue:delete(Q, ActingUser);
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
     case wait_for_promoted_or_stopped(Q) of
         {promoted, Q1} ->
@@ -1597,15 +1598,17 @@ basic_consume(Q,
   when ?amqqueue_is_stream(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
-    rabbit_log:info("basic_consume stream args ~w ~w", [Args, ConsumerPrefetchCount]),
+    rabbit_log:info("basic_consume stream args ~w ~w",
+                    [Args, ConsumerPrefetchCount]),
     ok = check_consume_arguments(QName, Args),
     QState0 = get_queue_client_state(Q, QName, QStates),
     Offset = case rabbit_misc:table_lookup(Args, <<"x-stream-offset">>) of
-                 undefined -> undefined;
-                 {_, V} -> V
+                 undefined ->
+                     undefined;
+                 {_, V} ->
+                     V
              end,
 
-    %% TODO: check consumer args from x-stream-offset
     %% FIXME: reply needs to be sent before the stream begins sending
     %% really it should be sent by the stream queue process like classic queues
     %% do

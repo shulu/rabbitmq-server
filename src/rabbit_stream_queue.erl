@@ -23,6 +23,7 @@
 
          %% mgmt
          declare/1,
+         delete/2,
 
          %% other
          open_files/1,
@@ -32,6 +33,7 @@
 
          ]).
 
+-define(DELETE_TIMEOUT, 5000).
 -define(STATISTICS_KEYS,
         [
          policy,
@@ -170,7 +172,7 @@ handle_aux(_RaMachine, _Type, {stream, Start, Max, Tag, Pid},
            Aux0, Log0, #?MODULE{cfg = Cfg,
                                 last_index = Last} = _MacState) ->
     %% TODO: assert Pid is local and return error
-    % rabbit_log:info("NEW STREAM: ~s", [Tag]),
+    rabbit_log:info("NEW STREAM: ~s start: ~b max: ~b", [Tag, Start, Max]),
     %% this works as a "skip to" function for exisiting streams. It does ignore
     %% any entries that are currently in flight
     %% read_cursor is the next item to read
@@ -380,6 +382,47 @@ declare(Q0) ->
     end.
 
 
+delete(Q, ActingUser) when ?amqqueue_is_stream(Q) ->
+    {Name, _} = amqqueue:get_pid(Q),
+    QName = amqqueue:get_name(Q),
+    QNodes = get_nodes(Q),
+    Timeout = ?DELETE_TIMEOUT,
+    {ok, ReadyMsgs, _} = stat(Q),
+    Servers = [{Name, Node} || Node <- QNodes],
+    case ra:delete_cluster(Servers, Timeout) of
+        {ok, {_, LeaderNode} = Leader} ->
+            MRef = erlang:monitor(process, Leader),
+            receive
+                {'DOWN', MRef, process, _, _} ->
+                    ok
+            after Timeout ->
+                    ok = rabbit_ra_queue:force_delete(Servers)
+            end,
+            ok = delete_queue_data(QName, ActingUser),
+            rpc:call(LeaderNode, rabbit_core_metrics, queue_deleted, [QName],
+                     1000),
+            {ok, ReadyMsgs};
+        {error, {no_more_servers_to_try, Errs}} ->
+            case lists:all(fun({{error, noproc}, _}) -> true;
+                              (_) -> false
+                           end, Errs) of
+                true ->
+                    %% If all ra nodes were already down, the delete
+                    %% has succeed
+                    delete_queue_data(QName, ActingUser),
+                    {ok, ReadyMsgs};
+                false ->
+                    %% attempt forced deletion of all servers
+                    rabbit_log:warning(
+                      "Could not delete quorum queue '~s', not enough nodes "
+                       " online to reach a quorum: ~255p."
+                       " Attempting force delete.",
+                      [rabbit_misc:rs(QName), Errs]),
+                    ok = rabbit_ra_queue:force_delete(Servers),
+                    delete_queue_data(QName, ActingUser),
+                    {ok, ReadyMsgs}
+            end
+    end.
 qname_to_rname(#resource{virtual_host = <<"/">>, name = Name}) ->
     erlang:binary_to_atom(<<"%2F_", Name/binary>>, utf8);
 qname_to_rname(#resource{virtual_host = VHost, name = Name}) ->
@@ -625,3 +668,9 @@ cluster_state(Name) ->
                 _ -> running
             end
     end.
+delete_queue_data(QName, ActingUser) ->
+    _ = rabbit_amqqueue:internal_delete(QName, ActingUser),
+    ok.
+
+stat(_Q) ->
+    {ok, 0, 0}.
