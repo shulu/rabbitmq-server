@@ -122,13 +122,6 @@ tick(_Ts, #?MODULE{cfg = #cfg{id = {Name, _},
                                            {N0, B0}) ->
                                                {N0 + N, B0 +B}
                                        end, {0, 0}, Segs),
-    % Metrics = {Name,
-    %            messages_ready(State),
-    %            num_checked_out(State), % checked out
-    %            messages_total(State),
-    %            query_consumer_count(State), % Consumers
-    %            EnqueueBytes,
-    %            CheckoutBytes},
     Infos = [
              {message_bytes_ready, NumBytes},
              {message_bytes_unacknowledged, 0},
@@ -155,9 +148,14 @@ tick(_Ts, #?MODULE{cfg = #cfg{id = {Name, _},
                    eval |
                    tick.
 
--record(stream, {next_index :: ra:index(),
-                 credit :: 0 | stream_index(),
-                 max = 1000 :: non_neg_integer()}).
+%% stream,undefined,53,0,97,-1,1,
+-record(stream, {name :: rabbit_types:r('queue'),
+                 next_index :: ra:index(),
+                 min_index = 0 :: ra:index(),
+                 max_index = 0 :: ra:index(),
+                 credit :: non_neg_integer(),
+                 max = 1000 :: non_neg_integer(),
+                 log :: undefined | ra_log_reader:state()}).
 
 -type aux_state() :: #{{pid(), ctag()} => #stream{}}.
 
@@ -168,86 +166,58 @@ init_aux(_) ->
 
 -spec handle_aux(term(), term(), aux_cmd(), aux_state(), Log, term()) ->
     {no_reply, aux_state(), Log} when Log :: term().
-handle_aux(_RaMachine, _Type, {stream, Start, Max, Tag, Pid},
-           Aux0, Log0, #?MODULE{cfg = Cfg,
-                                last_index = Last} = _MacState) ->
-    %% TODO: assert Pid is local and return error
-    rabbit_log:info("NEW STREAM: ~s start: ~b max: ~b", [Tag, Start, Max]),
-    %% this works as a "skip to" function for exisiting streams. It does ignore
-    %% any entries that are currently in flight
-    %% read_cursor is the next item to read
-    %% TODO: parse start offset and set accordingly
-    LastOffset = case Start of
-                     undefined ->
-                         %% if undefined set offset to next offset
-                         Last + 1;
-                     _ -> Start
-                 end,
-    Str0 = #stream{next_index = max(1, LastOffset),
-                   credit = Max,
-                   max = Max},
-    StreamId = {Tag, Pid},
-    {Str, Log} = stream_entries(StreamId, Last, Cfg, Str0, Log0),
-    AuxState = maps:put(StreamId, Str, Aux0),
-    % rabbit_log:info("handle aux new stream for ~s", [Tag]),
-    {no_reply, AuxState, Log, [{monitor, process, aux, Pid}]};
+handle_aux(_RaMachine, {call, _}, {register_reader, _Tag, Pid},
+           Aux0, Log0, #?MODULE{last_index = LastIdx} = _MacState) ->
+    %% TODO Tag needs to included in register
+
+    {LastWritten, _} = ra_log:last_written(Log0),
+    Last = min(LastWritten, LastIdx),
+
+    {Log, Effs} = ra_log:register_reader(Pid, Log0),
+    {reply, Last, Aux0, Log, [{monitor, process, aux, Pid} | Effs]};
 handle_aux(_RaMachine, _Type, {end_stream, Tag, Pid},
            Aux0, Log0, _MacState) ->
     StreamId = {Tag, Pid},
     {no_reply, maps:remove(StreamId, Aux0), Log0,
      [{monitor, process, aux, Pid}]};
-handle_aux(_RaMachine, _Type, {credit, StreamId, Credit},
-           Aux0, Log0, #?MODULE{cfg = Cfg,
-                                last_index = Last} = _MacState) ->
-   % rabbit_log:info("handle aux credit ~w", [Credit]),
-    case Aux0 of
-        #{StreamId := #stream{credit = Credit0} = Str0} ->
-            %% update stream with ack value, constrain it not to be larger than
-            %% the read index in case the streaming pid has skipped around in
-            %% the stream by issuing multiple stream/3 commands.
-            Str1 = Str0#stream{credit = Credit0 + Credit},
-            {Str, Log} = stream_entries(StreamId, Last, Cfg, Str1, Log0),
-            Aux = maps:put(StreamId, Str, Aux0),
-            {no_reply, Aux, Log};
-        _ ->
-            {no_reply, Aux0, Log0}
-    end;
 handle_aux(_RaMachine, _Type, {down, Pid, _Info},
            Aux0, Log0, #?MODULE{cfg = _Cfg} = _MacState) ->
     %% remove all streams for the pid
     Aux = maps:filter(fun ({_Tag, P}, _) -> P =/= Pid end, Aux0),
     {no_reply, Aux, Log0};
 handle_aux(_RaMachine, _Type, eval,
-           Aux0, Log0,  #?MODULE{cfg = Cfg,
+           Aux0, Log0,  #?MODULE{cfg = _Cfg,
                                  last_index = Last} = _MacState) ->
-    % rabbit_log:info("handle aux eval", []),
-    {Aux, Log} = maps:fold(fun (StreamId, S0, {A0, L0}) ->
-                                   {S, L} = stream_entries(StreamId, Last,
-                                                           Cfg, S0, L0),
-                                   {maps:put(StreamId, S, A0), L}
-                           end, {#{}, Log0}, Aux0),
-    {no_reply, Aux, Log};
+    %% Emit max index for all log readers
+    {LastWritten, _} = ra_log:last_written(Log0),
+    MaxIdx = min(LastWritten, Last),
+    Effs = [{send_msg, P, {max_index, MaxIdx}, [ra_event, local]}
+            || P <- ra_log:readers(Log0)],
+    {no_reply, Aux0, Log0, Effs};
 handle_aux(_RaMachine, _Type, tick,
            Aux0, Log0, _MacState) ->
     {no_reply, Aux0, Log0}.
 
-stream_entries({Tag, Pid} = StreamId,
-               MaxIndex,
-               #cfg{name = Name, id = Id} = Cfg,
-               #stream{credit = Credit,
-                       next_index = NextIdx} = Str0,
-               Log0) when NextIdx =< MaxIndex ->
-    %% e.g. min(101 + 50, 120) - 101
-    MaxCredit = 1 + min(NextIdx + Credit, MaxIndex) - NextIdx,
+stream_entries(Name, Id, Str) ->
+    stream_entries(Name, Id, Str, []).
 
-    % rabbit_log:info("stream entries from ~b ~b ~b",
-    %                 [NextIdx, MaxCredit, MaxIndex]),
+stream_entries(Name, Id,
+               #stream{
+                       credit = Credit,
+                       max_index = MaxIdx,
+                       next_index = NextIdx,
+                       log = Log0} = Str0, MsgIn)
+  when NextIdx =< MaxIdx ->
+    To = min(NextIdx + Credit - 1, MaxIdx),
 
-    %% TODO: RA should provide a safe api for reading logs that
-    case ra_log:take(NextIdx, MaxCredit, Log0) of
-        {[], Log} ->
-            {Str0, Log};
-        {Entries0, Log} ->
+    % rabbit_log:info("stream entries from ~b to ~b ~w ~w",
+    %                 [NextIdx, To, Log0, ets:tab2list(ra_log_open_mem_tables)]),
+    case ra_log_reader:read(NextIdx, To, Log0) of
+        {[], _, Log} ->
+            % rabbit_log:info("stream entries none out", []),
+            {Str0#stream{log = Log}, []};
+        {Entries0, _, Log} ->
+            % rabbit_log:info("stream entries got entries", [Entries0]),
             %% filter non usr append commands out
             Msgs = [begin
                         Msg = rabbit_basic:add_header(<<"x-stream-offset">>,
@@ -260,22 +230,27 @@ stream_entries({Tag, Pid} = StreamId,
 
             %% as all deliveries should be local we don't need to use
             %% nosuspend and noconnect here
-            gen_server:cast(Pid, {stream_delivery, Tag, Msgs}),
+            % gen_server:cast(Pid, {stream_delivery, Tag, Msgs}),
             Str = Str0#stream{credit = Credit - NumMsgs,
+                              log = Log,
                               next_index = NextIdx + NumEntries},
             % {Str, Log}
             case NumEntries == NumMsgs of
                 true ->
                     %% we are done here
-                    {Str, Log};
+                    % rabbit_log:info("stream entries out ~w ~w", [Entries0, Msgs]),
+                    {Str, MsgIn ++ Msgs};
                 false ->
                     %% if there are fewer Msgs than Entries0 it means there were non-events
                     %% in the log and we should recurse and try again
-                    stream_entries(StreamId, MaxIndex, Cfg, Str, Log)
+                    stream_entries(Name, Id, Str, MsgIn ++ Msgs)
             end
     end;
-stream_entries(_StreamId, _MaxIndex, _Cfg, Str, Log) ->
-    {Str, Log}.
+stream_entries(_Name, _Id, Str, Msgs) ->
+    % rabbit_log:info("stream entries none ~b ~b", [Str#stream.next_index,
+    %                                         Str#stream.max_index
+    %                                        ]),
+    {Str, Msgs}.
 
 %% CLIENT
 
@@ -286,7 +261,8 @@ stream_entries(_StreamId, _MaxIndex, _Cfg, Str, Log) ->
                         local = ra:server_id(),
                         servers = [ra:server_id()],
                         next_seq = 1 :: non_neg_integer(),
-                        correlation = #{} :: #{appender_seq() => term()}
+                        correlation = #{} :: #{appender_seq() => term()},
+                        readers = #{} :: #{term() => #stream{}}
                        }).
 
 init_client(QueueName, ServerIds) when is_list(ServerIds) ->
@@ -309,7 +285,47 @@ handle_event(_From, {applied, SeqsReplies},
     Correlation = maps:without(Seqs, Correlation0),
     Corrs = maps:values(maps:with(Seqs, Correlation0)),
     {internal, Corrs, [],
-     State#stream_client{correlation = Correlation}}.
+     State#stream_client{correlation = Correlation}};
+handle_event(_From, {machine, {ra_log_update, UId, MinIdx, SegRefs}},
+                      #stream_client{name = Name,
+                                     local = Local,
+                                     readers = Readers0} = State) ->
+    % rabbit_log:info("handle event ~w ~w", [MinIdx, SegRefs]),
+    Readers = maps:map(
+                fun(Tag, #stream{log = Log} = S0) ->
+                        L = case Log of
+                                undefined ->
+                                    ra_log_reader:init(UId, 1, SegRefs);
+                                L0 ->
+                                    ra_log_reader:handle_log_update(MinIdx,
+                                                                    SegRefs, L0)
+                            end,
+                        Str0 = S0#stream{log = L, min_index = MinIdx},
+                        {Str, Msgs} = stream_entries(Name, Local, Str0),
+                        %% HACK for now, better to just return but tricky with acks credits
+                        %% that also evaluate the stream
+                        gen_server:cast(self(), {stream_delivery, Tag, Msgs}),
+                        Str
+                end, Readers0),
+    % {{delivery, Tag, Msgs},
+    %  State#stream_client{readers = Readers0#{Tag => Str}}}.
+    {internal, [], [],
+     State#stream_client{readers = Readers}};
+handle_event(_From, {machine, {max_index, MaxIdx}},
+                      #stream_client{name = Name,
+                                     local = Local,
+                                     readers = Readers0} = State) ->
+    Readers = maps:map(
+                fun(Tag, S0) ->
+                        Str0 = S0#stream{max_index = MaxIdx},
+                        {Str, Msgs} = stream_entries(Name, Local, Str0),
+                        %% HACK for now, better to just return but tricky with acks credits
+                        %% that also evaluate the stream
+                        gen_server:cast(self(), {stream_delivery, Tag, Msgs}),
+                        Str
+                end, Readers0),
+    {internal, [], [],
+     State#stream_client{readers = Readers}}.
 
 append(#stream_client{leader = ServerId,
                       next_seq = Seq,
@@ -324,11 +340,24 @@ append(#stream_client{leader = ServerId,
     State#stream_client{next_seq = Seq + 1,
                         correlation = Correlation}.
 
-begin_stream(#stream_client{local = ServerId} = State, Tag, Offset, MaxInFlight)
-  when is_number(MaxInFlight) ->
+begin_stream(#stream_client{local = ServerId,
+                            readers = Readers0} = State,
+             Tag, Offset, Max)
+  when is_number(Max) ->
     Pid = self(),
-    ok = ra:cast_aux_command(ServerId, {stream, Offset, MaxInFlight, Tag, Pid}),
-    State.
+    Last = ra:aux_command(ServerId, {register_reader, Tag, Pid}),
+    LastOffset = case Offset of
+                     undefined ->
+                         %% if undefined set offset to next offset
+                         Last + 1;
+                     _ -> Offset
+                 end,
+    Str0 = #stream{next_index = max(1, LastOffset),
+                   credit = Max,
+                   max_index = Last,
+                   max = Max},
+    % StreamId = {Tag, Pid},
+    State#stream_client{readers = Readers0#{Tag => Str0}}.
 
 end_stream(#stream_client{local = ServerId} = State, Tag) ->
     Pid = self(),
@@ -336,9 +365,22 @@ end_stream(#stream_client{local = ServerId} = State, Tag) ->
     State.
 
 
-credit(#stream_client{local = ServerId} = State, Tag, Credit) ->
-    ok = ra:cast_aux_command(ServerId, {credit, {Tag, self()}, Credit}),
-    {ok, State}.
+credit(#stream_client{name = Name,
+                      local = Local,
+                      readers = Readers0} = State, Tag, Credit) ->
+    Readers = case Readers0 of
+                  #{Tag := #stream{credit = Credit0} = Str0} ->
+                      Str1 = Str0#stream{credit = Credit0 + Credit},
+                      {Str, Msgs} = stream_entries(Name, Local, Str1),
+                      %% HACK for now, better to just return but
+                      %% tricky with acks credits
+                      %% that also evaluate the stream
+                      gen_server:cast(self(), {stream_delivery, Tag, Msgs}),
+                      Readers0#{Tag => Str};
+                  _ ->
+                      Readers0
+              end,
+    {ok, State#stream_client{readers = Readers}}.
 
 %% MGMT
 

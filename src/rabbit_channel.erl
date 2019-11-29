@@ -670,6 +670,7 @@ handle_cast({stream_delivery, _CTag, _Msg},
             State = #ch{cfg = #conf{state = closing}}) ->
     noreply(State);
 handle_cast({stream_delivery, ConsumerTag, Msgs}, State0) ->
+    % rabbit_log:info("stream delivery ~w", [Msgs]),
     %% streams always require acks for now
     State = lists:foldl(
               fun(Msg, Acc) ->
